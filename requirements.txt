@@ -1,0 +1,2 @@
+numpy>=1.26,<3
+# Optional NVIDIA CUDA backend: install the CuPy wheel matching your CUDA runtime separately.
