@@ -2,26 +2,12 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
-
-from gpt_from_scratch.tokenizer import CharTokenizer, SubwordTokenizer, format_conversation, format_conversation_segments, load_tokenizer
-
-
-def iter_texts(path, max_docs=None):
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if max_docs is not None and i >= max_docs:
-                break
-            if not line.strip():
-                continue
-            obj = json.loads(line)
-            text = format_conversation(obj)
-            if text.strip():
-                yield text
+from gpt_from_scratch.data import read_documents, split_documents, encode_documents, BatchSampler
+from gpt_from_scratch.tokenizer import CharTokenizer, SubwordTokenizer, load_tokenizer, tokenizer_fingerprint
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Split complete conversations before training the tokenizer.")
     parser.add_argument("--input", default="dataset.jsonl")
     parser.add_argument("--out-dir", default="data/processed")
     parser.add_argument("--max-docs", type=int, default=50000)
@@ -33,75 +19,45 @@ def main():
     parser.add_argument("--subword-char-vocab", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--val-frac", type=float, default=0.01)
+    parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--assistant-loss-only", action="store_true")
     args = parser.parse_args()
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    texts = list(iter_texts(args.input, args.max_docs))
-    if not texts:
-        raise RuntimeError("No usable texts found.")
-
+    if args.seq_len < 1 or args.max_docs < 1 or args.vocab_size < 4:
+        parser.error("seq-len/max-docs must be positive and vocab-size at least 4")
+    documents = read_documents(args.input, args.max_docs)
+    train_docs, val_docs = split_documents(documents, args.val_frac, args.seed)
+    texts = ["".join(text for _, text in doc) for doc in train_docs]
     if args.tokenizer_in:
         tokenizer = load_tokenizer(args.tokenizer_in)
     elif args.tokenizer_type == "subword":
-        tokenizer = SubwordTokenizer.build(
-            texts,
-            args.vocab_size,
-            max_ngram=args.subword_max_ngram,
-            train_chars=args.subword_train_chars,
-            char_vocab=args.subword_char_vocab,
-        )
+        tokenizer = SubwordTokenizer.build(texts, args.vocab_size, max_ngram=args.subword_max_ngram,
+                                          train_chars=args.subword_train_chars, char_vocab=args.subword_char_vocab)
     else:
         tokenizer = CharTokenizer.build(texts, args.vocab_size)
+    encoded = {}
+    for name, docs in (("train", train_docs), ("val", val_docs)):
+        tokens, mask = encode_documents(docs, tokenizer, args.assistant_loss_only)
+        try:
+            BatchSampler(tokens, args.seq_len, mask)
+        except ValueError as exc:
+            raise ValueError(f"{name} split: {exc}; add data or reduce --seq-len") from exc
+        encoded[name] = tokens, mask
+    # Validate both splits before touching existing output files.
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save(out_dir / "tokenizer.json")
-
-    ids = []
-    masks = []
-    if args.assistant_loss_only:
-        with open(args.input, "r", encoding="utf-8") as f:
-            for doc_i, line in enumerate(f):
-                if args.max_docs is not None and doc_i >= args.max_docs:
-                    break
-                obj = json.loads(line)
-                ids.append(tokenizer.bos_id)
-                masks.append(0)
-                for kind, segment in format_conversation_segments(obj):
-                    seg_ids = tokenizer.encode(segment)
-                    ids.extend(seg_ids)
-                    masks.extend([1 if kind == "assistant" else 0] * len(seg_ids))
-                ids.append(tokenizer.eos_id)
-                masks.append(1)
-    else:
-        for text in texts:
-            encoded = tokenizer.encode(text, add_bos=True, add_eos=True)
-            ids.extend(encoded)
-            masks.extend([1] * len(encoded))
-
-    dtype = np.uint16 if tokenizer.vocab_size <= 65535 else np.uint32
-    data = np.asarray(ids, dtype=dtype)
-    split = max(args.seq_len + 2, int(len(data) * (1.0 - args.val_frac)))
-    split = min(split, len(data) - args.seq_len - 2)
-    train = data[:split]
-    val = data[split:]
-    mask_data = np.asarray(masks, dtype=np.uint8)
-    train_mask = mask_data[:split]
-    val_mask = mask_data[split:]
-
-    train.tofile(out_dir / "train.bin")
-    val.tofile(out_dir / "val.bin")
-    train_mask.tofile(out_dir / "train_mask.bin")
-    val_mask.tofile(out_dir / "val_mask.bin")
+    for name, (tokens, mask) in encoded.items():
+        tokens.tofile(out_dir / f"{name}.bin")
+        mask.tofile(out_dir / f"{name}_mask.bin")
     meta = {
-        "vocab_size": tokenizer.vocab_size,
-        "dtype": str(np.dtype(dtype)),
-        "train_tokens": int(train.size),
-        "val_tokens": int(val.size),
-        "max_docs": args.max_docs,
-        "seq_len": args.seq_len,
-        "assistant_loss_only": bool(args.assistant_loss_only),
-        "tokenizer_type": args.tokenizer_type if not args.tokenizer_in else "loaded",
+        "format_version": 2, "vocab_size": tokenizer.vocab_size,
+        "dtype": str(encoded["train"][0].dtype),
+        "train_tokens": len(encoded["train"][0]), "val_tokens": len(encoded["val"][0]),
+        "train_docs": len(train_docs), "val_docs": len(val_docs), "max_docs": args.max_docs,
+        "seq_len": args.seq_len, "assistant_loss_only": args.assistant_loss_only,
+        "has_loss_mask": True, "tokenizer_type": "subword" if isinstance(tokenizer, SubwordTokenizer) else "char",
+        "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer),
+        "split": "shuffled identical-conversation groups", "seed": args.seed,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(json.dumps(meta, indent=2, ensure_ascii=False))

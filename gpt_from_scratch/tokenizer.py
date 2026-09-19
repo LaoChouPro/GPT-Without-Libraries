@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -6,8 +7,26 @@ from pathlib import Path
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
 
 
+def validate_vocabulary(stoi):
+    if not isinstance(stoi, dict) or not all(t in stoi for t in SPECIAL_TOKENS):
+        raise ValueError("vocabulary must include all four special tokens")
+    if any(not isinstance(t, str) or not t for t in stoi):
+        raise ValueError("vocabulary tokens must be nonempty strings")
+    if any(type(i) is not int for i in stoi.values()) or set(stoi.values()) != set(range(len(stoi))):
+        raise ValueError("vocabulary IDs must be unique contiguous integers from zero")
+
+
+def tokenizer_fingerprint(tokenizer):
+    payload = {"type": "subword" if isinstance(tokenizer, SubwordTokenizer) else "char",
+               "stoi": tokenizer.stoi}
+    if isinstance(tokenizer, SubwordTokenizer):
+        payload["max_token_len"] = tokenizer.max_token_len
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 class CharTokenizer:
     def __init__(self, stoi):
+        validate_vocabulary(stoi)
         self.stoi = dict(stoi)
         self.itos = [None] * len(self.stoi)
         for token, idx in self.stoi.items():
@@ -19,6 +38,8 @@ class CharTokenizer:
 
     @classmethod
     def build(cls, texts, vocab_size):
+        if vocab_size < len(SPECIAL_TOKENS):
+            raise ValueError("vocab_size must be at least 4")
         counter = Counter()
         for text in texts:
             counter.update(text)
@@ -68,6 +89,7 @@ class CharTokenizer:
 
 class SubwordTokenizer:
     def __init__(self, stoi, max_token_len=None):
+        validate_vocabulary(stoi)
         self.stoi = dict(stoi)
         self.itos = [None] * len(self.stoi)
         for token, idx in self.stoi.items():
@@ -76,10 +98,19 @@ class SubwordTokenizer:
         self.unk_id = self.stoi["<unk>"]
         self.bos_id = self.stoi["<bos>"]
         self.eos_id = self.stoi["<eos>"]
-        self.max_token_len = max_token_len or max(len(t) for t in self.stoi if t not in SPECIAL_TOKENS)
+        longest = max((len(t) for t in self.stoi if t not in SPECIAL_TOKENS), default=1)
+        self.max_token_len = longest if max_token_len is None else max_token_len
+        if type(self.max_token_len) is not int or self.max_token_len < longest:
+            raise ValueError("max_token_len must cover every ordinary vocabulary token")
 
     @classmethod
     def build(cls, texts, vocab_size, max_ngram=6, train_chars=8_000_000, char_vocab=None, min_freq=3):
+        if vocab_size < len(SPECIAL_TOKENS):
+            raise ValueError("vocab_size must be at least 4")
+        if max_ngram < 1 or train_chars < 1 or min_freq < 1 or (char_vocab is not None and char_vocab < 1):
+            raise ValueError("subword training limits must be positive")
+        if vocab_size == len(SPECIAL_TOKENS):
+            return cls({token: i for i, token in enumerate(SPECIAL_TOKENS)}, max_ngram)
         char_counter = Counter()
         ngram_counter = Counter()
         seen_chars = 0
@@ -157,7 +188,7 @@ class SubwordTokenizer:
             for j in range(max_j, i, -1):
                 token = text[i:j]
                 idx = self.stoi.get(token)
-                if idx is not None:
+                if idx is not None and token not in SPECIAL_TOKENS:
                     found = (idx, j)
                     break
             if found is None:
@@ -194,26 +225,20 @@ def load_tokenizer(path):
 
 
 def format_conversation(obj):
-    parts = []
-    for msg in obj.get("conversations", []):
-        role = msg.get("role", "")
-        content = str(msg.get("content", "")).strip()
-        if not content:
-            continue
-        if role == "user":
-            parts.append(f"用户：{content}\n")
-        elif role == "assistant":
-            parts.append(f"助手：{content}\n")
-        else:
-            parts.append(f"{role}：{content}\n")
-    return "".join(parts).strip() + "\n"
+    return "".join(segment for _, segment in format_conversation_segments(obj))
 
 
 def format_conversation_segments(obj):
+    if not isinstance(obj, dict) or not isinstance(obj.get("conversations"), list):
+        raise ValueError("each record must contain a conversations list")
     segments = []
-    for msg in obj.get("conversations", []):
-        role = msg.get("role", "")
-        content = str(msg.get("content", "")).strip()
+    for msg in obj["conversations"]:
+        if not isinstance(msg, dict):
+            raise ValueError("conversation messages must be objects")
+        role, content = msg.get("role"), msg.get("content")
+        if not isinstance(role, str) or not role.strip() or not isinstance(content, str):
+            raise ValueError("messages require a nonempty role and string content")
+        content = content.strip()
         if not content:
             continue
         if role == "user":

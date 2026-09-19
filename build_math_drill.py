@@ -1,5 +1,6 @@
 import argparse
 import json
+from pathlib import Path
 import random
 
 
@@ -15,6 +16,9 @@ def main():
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20260427)
     args = parser.parse_args()
+    if args.max_add < 0 or args.max_mul < 0 or args.repeat < 1:
+        parser.error("max-add/max-mul must be nonnegative and repeat positive")
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     examples = []
     for _ in range(args.repeat):

@@ -1,5 +1,6 @@
 import argparse
 import json
+from pathlib import Path
 
 
 BAD_PHRASES = (
@@ -32,13 +33,22 @@ def main():
     parser.add_argument("--max-out", type=int, default=200000)
     parser.add_argument("--min-answer-chars", type=int, default=40)
     args = parser.parse_args()
+    if any(value is not None and value < 0 for value in (args.max_in, args.max_out, args.min_answer_chars)):
+        parser.error("filter limits must be nonnegative")
+    if Path(args.input).resolve() == Path(args.output).resolve():
+        parser.error("input and output must be different files")
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     kept = 0
     seen = 0
     with open(args.input, "r", encoding="utf-8") as src, open(args.output, "w", encoding="utf-8") as dst:
         for line in src:
+            if args.max_out is not None and kept >= args.max_out:
+                break
             if args.max_in is not None and seen >= args.max_in:
                 break
+            if not line.strip():
+                continue
             seen += 1
             obj = json.loads(line)
             answer = assistant_text(obj)

@@ -1,4 +1,7 @@
 import math
+import os
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -13,7 +16,60 @@ def get_xp(device="cuda"):
         if cp is None:
             raise RuntimeError("CuPy is not installed.")
         return cp
-    return np
+    if device == "cpu":
+        return np
+    raise ValueError(f"unknown device: {device}")
+
+
+def to_numpy(value):
+    return cp.asnumpy(value) if cp is not None and isinstance(value, cp.ndarray) else np.asarray(value)
+
+
+def atomic_savez(path, arrays):
+    """Never replace a usable checkpoint with a partially written archive."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".npz", delete=False) as f:
+            temporary = f.name
+            np.savez(f, **arrays)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def cross_entropy(logits, targets, loss_mask=None):
+    """Stable log-sum-exp loss and its exact logit gradient."""
+    xp = np_or_cp(logits)
+    if targets.shape != logits.shape[:-1] or targets.dtype.kind not in "iu":
+        raise ValueError("targets must be integer token IDs with shape logits.shape[:-1]")
+    if bool(xp.any((targets < 0) | (targets >= logits.shape[-1])).item()):
+        raise ValueError("target token ID outside vocabulary")
+    shifted = logits - xp.max(logits, axis=-1, keepdims=True)
+    exp_logits = xp.exp(shifted)
+    sums = xp.sum(exp_logits, axis=-1, keepdims=True)
+    flat = shifted.reshape(-1, logits.shape[-1])
+    rows = xp.arange(targets.size)
+    token_losses = xp.log(sums.reshape(-1)) - flat[rows, targets.reshape(-1)]
+    mask = xp.ones(targets.size, dtype=logits.dtype)
+    if loss_mask is not None:
+        if loss_mask.shape != targets.shape:
+            raise ValueError("loss_mask must have the same shape as targets")
+        mask = xp.asarray(loss_mask, dtype=logits.dtype).reshape(-1)
+        if not bool(xp.all(xp.isfinite(mask) & (mask >= 0)).item()):
+            raise ValueError("loss_mask must be finite and nonnegative")
+    denom = xp.sum(mask)
+    if float(denom.item()) <= 0:
+        raise ValueError("loss_mask contains no supervised tokens")
+    loss = xp.sum(token_losses * mask) / denom
+    grad = (exp_logits / sums).reshape(-1, logits.shape[-1])
+    grad[rows, targets.reshape(-1)] -= 1
+    grad *= mask[:, None] / denom
+    return loss, grad.reshape(logits.shape)
 
 
 def gelu(x):
@@ -85,6 +141,11 @@ def linear_backward(dout, cache):
 
 class GPT:
     def __init__(self, vocab_size, seq_len, d_model=128, n_layers=3, n_heads=4, d_ff=None, seed=1337, device="cuda"):
+        dimensions = dict(vocab_size=vocab_size, seq_len=seq_len, d_model=d_model,
+                          n_layers=n_layers, n_heads=n_heads, d_ff=d_ff if d_ff is not None else 4 * d_model)
+        for name, value in dimensions.items():
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
         self.xp = get_xp(device)
@@ -97,6 +158,8 @@ class GPT:
         self.d_ff = d_ff or 4 * d_model
         self.device = device
         self.params = {}
+        self.config = {name: int(value) for name, value in dimensions.items()}
+        self.causal_mask = self.xp.triu(self.xp.ones((seq_len, seq_len), dtype=bool), 1)
         rng = np.random.default_rng(seed)
 
         def randn(shape, scale):
@@ -126,6 +189,10 @@ class GPT:
 
     def forward(self, idx, targets=None, loss_mask=None):
         xp = self.xp
+        if idx.ndim != 2 or min(idx.shape) == 0 or idx.dtype.kind not in "iu":
+            raise ValueError("idx must be a nonempty 2D integer array")
+        if bool(xp.any((idx < 0) | (idx >= self.vocab_size)).item()):
+            raise ValueError("input token ID outside vocabulary")
         bsz, tsz = idx.shape
         if tsz > self.seq_len:
             raise ValueError(f"sequence length {tsz} exceeds model limit {self.seq_len}")
@@ -143,8 +210,8 @@ class GPT:
             k = k.reshape(bsz, tsz, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
             v = v.reshape(bsz, tsz, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
             scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
-            mask = xp.triu(xp.ones((tsz, tsz), dtype=bool), 1)
-            scores = xp.where(mask[None, None, :, :], -1e9, scores)
+            mask = self.causal_mask[:tsz, :tsz]
+            scores = xp.where(mask[None, None, :, :], -xp.inf, scores)
             att = softmax(scores, axis=-1)
             y = att @ v
             y_merge = y.transpose(0, 2, 1, 3).reshape(bsz, tsz, self.d_model)
@@ -166,25 +233,7 @@ class GPT:
         if targets is None:
             return logits, caches
 
-        probs = softmax(logits, axis=-1)
-        flat_targets = targets.reshape(-1)
-        flat_probs = probs.reshape(-1, self.vocab_size)
-        rows = xp.arange(flat_targets.size)
-        token_losses = -xp.log(flat_probs[rows, flat_targets] + 1e-12)
-        if loss_mask is not None:
-            flat_mask = loss_mask.reshape(-1).astype(xp.float32)
-            denom = xp.maximum(xp.sum(flat_mask), 1.0)
-            loss = xp.sum(token_losses * flat_mask) / denom
-        else:
-            flat_mask = None
-            denom = flat_targets.size
-            loss = xp.mean(token_losses)
-        dlogits = probs
-        dlogits = dlogits.reshape(-1, self.vocab_size)
-        dlogits[rows, flat_targets] -= 1.0
-        if flat_mask is not None:
-            dlogits *= flat_mask[:, None]
-        dlogits = dlogits.reshape(logits.shape) / denom
+        loss, dlogits = cross_entropy(logits, targets, loss_mask)
         return loss, dlogits, caches
 
     def backward(self, dlogits, caches):
@@ -236,16 +285,35 @@ class GPT:
         return grads
 
     def save(self, path, extra=None):
-        arrays = {k: cp.asnumpy(v) if cp is not None and isinstance(v, cp.ndarray) else v for k, v in self.params.items()}
-        if extra:
-            for k, v in extra.items():
-                arrays["extra." + k] = np.asarray(v)
-        np.savez(path, **arrays)
+        arrays = {k: to_numpy(v) for k, v in self.params.items()}
+        metadata = dict(extra or {})
+        for k, v in self.config.items():
+            if k in metadata and metadata[k] != v:
+                raise ValueError(f"checkpoint metadata disagrees with model: {k}")
+            metadata[k] = v
+        arrays.update({"extra." + k: np.asarray(v) for k, v in metadata.items()})
+        atomic_savez(path, arrays)
 
     @classmethod
-    def load(cls, path, vocab_size, seq_len, d_model, n_layers, n_heads, d_ff=None, device="cuda"):
-        model = cls(vocab_size, seq_len, d_model, n_layers, n_heads, d_ff=d_ff, device=device)
-        data = np.load(path)
-        for k in model.params:
-            model.params[k][...] = model.xp.asarray(data[k])
+    def load(cls, path, vocab_size=None, seq_len=None, d_model=None, n_layers=None, n_heads=None, d_ff=None, device="cuda"):
+        requested = dict(vocab_size=vocab_size, seq_len=seq_len, d_model=d_model,
+                         n_layers=n_layers, n_heads=n_heads, d_ff=d_ff)
+        with np.load(path, allow_pickle=False) as data:
+            config = {}
+            for k, value in requested.items():
+                stored = int(data["extra." + k]) if "extra." + k in data else None
+                if value is not None and stored is not None and value != stored:
+                    raise ValueError(f"checkpoint {k}={stored}, requested {value}")
+                config[k] = stored if value is None else value
+            if config["d_ff"] is None and config["d_model"] is not None:
+                config["d_ff"] = 4 * config["d_model"]
+            if any(v is None for v in config.values()):
+                raise ValueError("legacy checkpoint lacks model configuration; supply dimensions explicitly")
+            model = cls(**config, device=device)
+            for k, param in model.params.items():
+                if k not in data or data[k].shape != param.shape:
+                    raise ValueError(f"checkpoint parameter missing or wrong shape: {k}")
+                if data[k].dtype.kind != "f" or not np.isfinite(data[k]).all():
+                    raise ValueError(f"checkpoint parameter is not finite floating-point data: {k}")
+                param[...] = model.xp.asarray(data[k])
         return model

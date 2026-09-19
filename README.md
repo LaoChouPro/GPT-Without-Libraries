@@ -1,502 +1,128 @@
 # GPT Without Libraries
 
-一个从零实现的迷你 GPT 训练项目。模型、反向传播、优化器、数据管线和采样逻辑都直接用 Python + NumPy/CuPy 编写，不依赖 PyTorch、TensorFlow、JAX、Keras、Transformers 等深度学习框架。
+从零实现的小型 decoder-only Transformer。前向传播、手写反向传播、AdamW、数据准备、checkpoint 和生成只使用 Python 标准库与 NumPy；NVIDIA GPU 可选用 CuPy。不依赖 PyTorch、TensorFlow、JAX 或 Transformers。
 
-这个项目的目标不是做一个大模型包装器，而是把一个 decoder-only Transformer 从参数初始化、前向传播、手写 backward、AdamW 更新、数据编码、loss mask、checkpoint、采样全部打通，并在本地中文对话数据上训练出一个可观察的小语言模型。
+这是学习和小规模实验项目。仓库不包含预训练权重或历史 30 万条训练数据；随附的 24 条原创对话仅用于跑通流程，不能据此宣称模型具备可靠问答或推理能力。
 
-## 当前状态
+## 快速开始（CPU）
 
-项目已经完成了从零训练到课程微调的基本闭环：
-
-- 先在 `dataset.jsonl` 的 30 万条原始对话样本上训练中文对话底座。
-- 发现原始数据中存在大量拒答模板、实时信息模板、身份污染和翻译噪声后，加入课程数据和过滤数据进行纠偏。
-- 当前主模型可以稳定完成一部分短问答，例如四大发明、北京春季出游、机器学习解释、学习计划等。
-- 冷门知识、抽象类比、文言文、外语混合输入和复杂推理仍然不可靠。
-
-推荐 checkpoint：
-
-```text
-data/checkpoints_stage2/best.npz
-```
-
-稍大参数实验分支：
-
-```text
-data/checkpoints_large_stage2/best.npz
-```
-
-## 设计原则
-
-本项目尽量保持实现透明，避免把关键训练逻辑藏在框架内部。
-
-- 只依赖 `numpy` 或 `cupy` 做张量计算。
-- 模型参数是普通字典里的数组。
-- 每个算子显式保存 cache，并在 backward 中手写梯度。
-- 训练脚本直接调用 `forward -> backward -> AdamW.step`。
-- checkpoint 使用 `.npz` 保存，可以直接用 NumPy 打开检查权重。
-- 数据格式保持简单，方便替换为自己的 JSONL 对话数据。
-
-## 模型结构
-
-核心实现位于：
-
-```text
-gpt_from_scratch/model.py
-```
-
-整体结构是标准 decoder-only Transformer：
-
-```text
-token ids
-  -> token embedding
-  -> position embedding
-  -> Transformer block x N
-       -> LayerNorm
-       -> causal self-attention
-       -> residual connection
-       -> LayerNorm
-       -> MLP: Linear -> GELU -> Linear
-       -> residual connection
-  -> final LayerNorm
-  -> tied output projection
-  -> logits
-```
-
-当前主模型配置：
-
-| item | value |
-| --- | ---: |
-| vocab size | 8000 |
-| context length | 192 |
-| d_model | 192 |
-| layers | 4 |
-| attention heads | 6 |
-| head dim | 32 |
-| FFN hidden size | 768 |
-| parameters | about 3.35M |
-
-稍大实验模型配置：
-
-| item | value |
-| --- | ---: |
-| vocab size | 8000 |
-| context length | 192 |
-| d_model | 256 |
-| layers | 6 |
-| attention heads | 8 |
-| head dim | 32 |
-| FFN hidden size | 1024 |
-| parameters | about 6.84M |
-
-### Attention
-
-attention 使用 causal mask，保证第 `t` 个 token 只能看到 `0..t` 的历史上下文：
-
-```python
-scores = (q @ k.transpose(0, 1, 3, 2)) / math.sqrt(self.head_dim)
-mask = xp.triu(xp.ones((tsz, tsz), dtype=bool), 1)
-scores = xp.where(mask[None, None, :, :], -1e9, scores)
-att = softmax(scores, axis=-1)
-y = att @ v
-```
-
-Q、K、V 由一个合并矩阵产生，再按最后一维切分：
-
-```python
-qkv = linear(ln1, qkv_w, qkv_b)
-q, k, v = xp.split(qkv, 3, axis=-1)
-```
-
-### Pre-LN block
-
-每个 block 使用 pre-layernorm：
-
-```text
-h = h + attention(layernorm(h))
-h = h + mlp(layernorm(h))
-```
-
-小模型训练时，pre-LN 比 post-LN 更容易稳定，尤其是在没有框架自动混合精度、没有复杂初始化策略的情况下。
-
-### 权重共享
-
-输出层没有单独的 `lm_head` 参数，而是复用 token embedding：
-
-```python
-logits = h @ self.params["tok_emb"].T
-```
-
-这样可以减少参数量，也让小模型更快收敛。
-
-## 手写反向传播
-
-项目没有 autograd。下面这些 backward 都是手写的：
-
-- `linear_backward`
-- `layernorm_backward`
-- `gelu_backward`
-- attention backward
-- residual 梯度合流
-- token embedding 梯度累加
-- position embedding 梯度累加
-- tied output projection 对 embedding 的梯度
-
-attention backward 中显式计算：
-
-```text
-datt = dy @ v.T
-dv   = att.T @ dy
-ds   = softmax_backward(datt)
-dq   = ds @ k
-dk   = ds.T @ q
-```
-
-embedding 梯度使用 `xp.add.at` 累加重复 token 的贡献：
-
-```python
-xp.add.at(grads["tok_emb"], flat_idx, flat_dh)
-```
-
-这部分实现牺牲了一些性能，但非常适合检查梯度流向和理解训练过程。
-
-## 优化器
-
-优化器位于：
-
-```text
-gpt_from_scratch/optim.py
-```
-
-实现了一个简洁版 AdamW：
-
-- `beta1 = 0.9`
-- `beta2 = 0.95`
-- bias correction
-- decoupled weight decay
-- embedding 和一维参数跳过 weight decay
-
-训练脚本中还包含：
-
-- warmup
-- cosine learning rate decay
-- global grad norm clipping
-- periodic eval
-- best/latest checkpoint 保存
-
-## Tokenizer
-
-Tokenizer 位于：
-
-```text
-gpt_from_scratch/tokenizer.py
-```
-
-当前主线使用字符级 tokenizer，词表大小 8000。中文小数据场景下，字符级 tokenizer 更稳，尤其是在没有完整 BPE/Unigram 训练器的情况下。
-
-项目中也实现了一个简单 subword tokenizer，但当前实验结果不如字符级稳定。
-
-特殊 token：
-
-```text
-<pad>
-<unk>
-<bos>
-<eos>
-```
-
-对话会被格式化为：
-
-```text
-用户：...
-助手：...
-```
-
-## Assistant-only loss
-
-训练数据中既有用户输入，也有助手回答。为了让模型更集中学习“回答”，数据准备阶段可以生成 loss mask：
+Python 3.11+，在仓库根目录运行：
 
 ```bash
-python3 prepare_data.py \
-  --input dataset.jsonl \
-  --out-dir data/char_300k \
-  --max-docs 300000 \
-  --vocab-size 8000 \
-  --seq-len 192 \
-  --assistant-loss-only
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+
+python prepare_data.py \
+  --input examples/tiny_dialogues.jsonl \
+  --out-dir data/tiny --seq-len 32 --val-frac 0.2 \
+  --vocab-size 512 --assistant-loss-only
+
+python train.py \
+  --data-dir data/tiny --checkpoint-dir data/tiny_checkpoints \
+  --steps 100 --batch-size 4 --d-model 32 --n-layers 2 --n-heads 4 \
+  --lr 0.003 --min-lr 0.0003 --warmup-steps 10 \
+  --eval-every 50 --eval-iters 5 --save-every 50 --device cpu
+
+python sample.py \
+  --data-dir data/tiny --checkpoint data/tiny_checkpoints/best.npz \
+  --prompt $'用户：你好。\n助手：' --max-new-tokens 60 \
+  --temperature 0 --device cpu
 ```
 
-开启后：
+训练从 `meta.json` 读取上下文长度；采样从 checkpoint 读取完整模型配置。生成包含原始 prompt；`--temperature 0` 为贪心解码，正数为概率采样，`--top-k 0` 关闭 top-k，`--seed` 控制可复现采样。建议实际对话 prompt 使用 `用户：问题\n助手：` 的格式（其中 `\n` 为真实换行）。
 
-- 用户部分只作为上下文。
-- 助手部分参与 cross entropy。
-- `<eos>` 也参与训练，帮助模型学会停止。
+默认 CPU，CUDA 环境请自行安装与驱动匹配的 CuPy 发行包，并给训练和采样加 `--device cuda`。没有 CuPy 时明确报错，不会悄悄回退到 CPU。GPU 路径尚未在本次修复中实机验证。
 
-训练时还会优先采样助手 token 比例足够高的窗口：
+## 自己的数据
 
-```bash
---min-mask-frac 0.25
-```
-
-这能避免 batch 里大部分 token 都是不计 loss 的提示文本。
-
-## 数据管线
-
-原始数据格式为 JSONL：
+每行一条完整对话，UTF-8 JSONL：
 
 ```json
-{"conversations":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
+{"conversations":[{"role":"user","content":"你好"},{"role":"assistant","content":"你好，很高兴和你交流。"}]}
 ```
-
-数据准备脚本会输出：
-
-```text
-train.bin
-val.bin
-train_mask.bin
-val_mask.bin
-tokenizer.json
-meta.json
-```
-
-token 文件使用 `uint16` 或 `uint32` 存储，取决于词表大小。
-
-## 训练路线
-
-实际效果比较好的路线不是直接把原始数据喂到底，而是分阶段训练。
-
-### 1. 原始 30 万条预训练
 
 ```bash
-python3 prepare_data.py \
-  --input dataset.jsonl \
-  --out-dir data/char_300k \
-  --max-docs 300000 \
-  --vocab-size 8000 \
-  --seq-len 192 \
-  --assistant-loss-only
-
-python3 train.py \
-  --data-dir data/char_300k \
-  --checkpoint-dir data/checkpoints_char300k \
-  --steps 12000 \
-  --batch-size 16 \
-  --seq-len 192 \
-  --d-model 192 \
-  --n-layers 4 \
-  --n-heads 6 \
-  --lr 8e-5 \
-  --min-lr 8e-6 \
-  --warmup-steps 300 \
-  --weight-decay 0.01 \
-  --eval-every 1000 \
-  --eval-iters 30 \
-  --save-every 1000 \
-  --min-mask-frac 0.25
+python prepare_data.py --input dataset.jsonl --out-dir data/processed \
+  --seq-len 128 --val-frac 0.05 --vocab-size 6000 --assistant-loss-only
 ```
 
-这一阶段学到中文分布、对话格式和基本句子结构，但原始数据噪声会让小模型频繁输出拒答模板或无意义套话。
+- 空行和空对话跳过；格式错误会报告文件和行号。`--max-docs` 限制有效对话数量。
+- 按完整对话划分；相同格式化内容的重复样本归为一组，避免重复课程样本跨集合泄漏。`--val-frac` 是独立对话组的比例，重复次数不同会使 token 比例偏离该值。
+- 只用训练集建立词表。验证集的未见字符会编码为 `<unk>`；这不能视为模型已经学会这些字符。
+- 每个集合必须至少有 `seq_len + 1` 个 token，并能产生有监督信号的窗口。数据太少时明确报错，添加数据或降低 `--seq-len`。
+- `--assistant-loss-only` 仅监督回答及回答末尾的 EOS；用户文本和角色前缀作为上下文。每条对话必须含非空助手回答。
+- `--min-mask-frac` 限制训练窗口内的监督比例。无合格窗口时会报错，不会把无监督窗口当作有效训练。验证仅排除零监督窗口，不使用训练比例阈值。
+- 可用 `--tokenizer-type subword` 试验贪心子词编码；默认字符级更简单。微调时用 `--tokenizer-in 原数据目录/tokenizer.json` 保持 token ID 一致。
 
-### 2. 课程数据纠偏
+输出 `train.bin`、`val.bin`、对应 `*_mask.bin`、`tokenizer.json` 和 `meta.json`。token 为 uint16 或 uint32，mask 为 uint8。新格式总是加载 mask，即使全 token 训练也不监督跨文档的 BOS。
 
-课程数据由 `build_curriculum.py` 构建，包含：
+训练窗口仍会跨越同一集合内的文档，attention 不做文档隔离；这属于简单连续流训练，不是按文档独立的 packing。重复内容分组仅防止完全相同的格式化对话泄漏，不检测语义相近问题或等价算式。
 
-- 高质量短问答样本
-- 自动生成的简单算术样本
-- 从原始数据中过滤出的较干净样本
-- 主题样本加权，例如四大发明、北京春天、机器学习解释等
+## 保存、续训与微调
+
+`best.npz` 保存最低采样验证损失对应的状态；`latest.npz` 按 `--save-every` 保存，并在正常结束或 `--stop-after` 停止时保存。意外中断时使用最近一次已完成的 checkpoint。
+
+新版 checkpoint 包含：
+
+- 权重、模型结构、tokenizer 指纹；加载时检查形状、有限数值及词表身份。
+- AdamW 一阶/二阶矩、优化器步数、训练步数和最佳验证损失。
+- batch 随机数状态、学习率日程参数和数据指纹。
+
+写入采用临时文件加原子替换，避免中途写坏已有 checkpoint。保存不使用 pickle。
+
+例如先运行到第 50 步，仍按总共 100 步安排学习率：
 
 ```bash
-python3 build_curriculum.py \
-  --input dataset.jsonl \
-  --output data/curriculum_stage2.jsonl \
-  --max-source 300000 \
-  --max-general 10000 \
-  --max-topic 3000 \
-  --seed-repeat 300
+python train.py --data-dir data/tiny --checkpoint-dir data/resume_demo \
+  --steps 100 --stop-after 50 --batch-size 4 \
+  --d-model 32 --n-layers 2 --n-heads 4 \
+  --lr 0.003 --min-lr 0.0003 --warmup-steps 10 \
+  --eval-every 50 --eval-iters 5 --save-every 50
+
+python train.py --data-dir data/tiny --checkpoint-dir data/resume_demo \
+  --resume data/resume_demo/latest.npz --steps 100 --batch-size 4 \
+  --lr 0.003 --min-lr 0.0003 --warmup-steps 10 \
+  --eval-every 50 --eval-iters 5 --save-every 50
 ```
 
-再使用原 tokenizer 编码，保证 checkpoint 兼容：
+`--steps` 是整个日程的总步数，不是额外训练步数。续训要求相同数据、设备、训练日程和验证配置；不匹配会拒绝恢复。验证/预览使用独立 RNG，不影响训练采样。CPU 的连续运行与恢复运行已做逐数组一致性测试；不同硬件或 NumPy/CuPy 版本不保证逐位一致。
+
+改变数据或日程应使用 `--init-from` 微调：加载模型结构及权重，从新的 AdamW 状态开始。
 
 ```bash
-python3 prepare_data.py \
-  --input data/curriculum_stage2.jsonl \
-  --out-dir data/curriculum_stage2 \
-  --max-docs 1000000 \
-  --tokenizer-in data/char_300k/tokenizer.json \
-  --seq-len 192 \
-  --val-frac 0.02 \
-  --assistant-loss-only
+python train.py --data-dir data/tiny --checkpoint-dir data/finetune \
+  --init-from data/tiny_checkpoints/best.npz --steps 100 \
+  --batch-size 4 --lr 0.0001 --min-lr 0.00001
 ```
 
-微调：
+旧 checkpoint 若带结构元数据仍可采样或 `--init-from`；没有 tokenizer 指纹会警告，必须使用当时的原始 tokenizer。旧权重无法恢复不存在的优化器状态。只保存权重且没有结构元数据的文件，可通过 Python `GPT.load(..., vocab_size=..., seq_len=..., d_model=..., n_layers=..., n_heads=...)` 显式加载。
+
+## 验证
 
 ```bash
-python3 train.py \
-  --data-dir data/curriculum_stage2 \
-  --checkpoint-dir data/checkpoints_stage2 \
-  --init-from data/checkpoints_focused/best.npz \
-  --steps 2500 \
-  --batch-size 16 \
-  --seq-len 192 \
-  --d-model 192 \
-  --n-layers 4 \
-  --n-heads 6 \
-  --lr 2e-5 \
-  --min-lr 3e-6 \
-  --warmup-steps 100 \
-  --weight-decay 0.001 \
-  --eval-every 500 \
-  --eval-iters 40 \
-  --save-every 500 \
-  --min-mask-frac 0.40
+python -m unittest discover -s tests -v
 ```
 
-### 3. 稍大模型实验
+测试包括全部参数的中心差分梯度、多头因果性、稳定交叉熵、loss mask、AdamW 参考计算、最短 batch、重复数据隔离、tokenizer 校验、小模型过拟合、命令行端到端及精确恢复。临时数据由测试自动清理；GitHub Actions 在 Python 3.11/3.12 与 NumPy 1.x/2.x 上运行。
 
-```bash
-python3 train.py \
-  --data-dir data/curriculum_focused \
-  --checkpoint-dir data/checkpoints_large_focused \
-  --steps 1800 \
-  --batch-size 12 \
-  --seq-len 192 \
-  --d-model 256 \
-  --n-layers 6 \
-  --n-heads 8 \
-  --lr 1e-4 \
-  --min-lr 1e-5 \
-  --warmup-steps 100 \
-  --weight-decay 0.001 \
-  --eval-every 300 \
-  --eval-iters 40 \
-  --save-every 300 \
-  --min-mask-frac 0.45
-```
+本次结果与限制见 [验证报告](docs/VALIDATION.md)。旧 README 中的训练路线和输出保留在 [历史训练记录](docs/HISTORICAL_TRAINING.md)，其中的权重、指标和 GPU 吞吐量本次未复现。
 
-稍大模型更容易拟合课程任务，但混入通用样本后仍然需要更干净的数据和更长训练。
+## 代码结构
 
-## 采样
+| 文件 | 内容 |
+| --- | --- |
+| `gpt_from_scratch/model.py` | Pre-LN Transformer、GELU、因果注意力、共享 embedding、手写梯度 |
+| `gpt_from_scratch/optim.py` | AdamW 及优化器状态 |
+| `gpt_from_scratch/data.py` | 对话读取、分组划分、有监督窗口采样 |
+| `gpt_from_scratch/tokenizer.py` | 字符/子词编码、对话格式、词表指纹 |
+| `gpt_from_scratch/checkpoint.py` | 完整训练状态保存与恢复 |
+| `gpt_from_scratch/sampling.py` | 共享生成逻辑 |
+| `prepare_data.py`, `train.py`, `sample.py` | 命令行入口 |
+| `build_curriculum.py`, `build_math_drill.py`, `filter_dataset.py` | 可选课程/算术数据与启发式过滤 |
 
-```bash
-python3 sample.py \
-  --data-dir data/curriculum_stage2 \
-  --checkpoint data/checkpoints_stage2/best.npz \
-  --prompt $'用户：北京春季去哪赏花？\n助手：' \
-  --max-new-tokens 140 \
-  --temperature 0.35 \
-  --top-k 12
-```
-
-示例输出：
-
-```text
-用户：北京春季去哪赏花？
-助手：北京春天适合去玉渊潭看樱花、去颐和园和北海公园踏青、去北京植物园赏桃花，也可以去奥林匹克森林公园散步骑行。出门前注意查看风沙和花粉情况。
-```
-
-另一个示例：
-
-```text
-用户：请用一段话介绍中国古代四大发明。
-助手：中国古代四大发明是造纸术、印刷术、火药和指南针。造纸术和印刷术推动了知识传播，火药改变了军事技术，指南针促进了航海和远距离交流。它们对中国和世界文明的发展都有深远影响。
-```
-
-失败示例：
-
-```text
-用户：23加19等于多少？
-助手：20加10等于120。
-```
-
-这类失败很重要。它说明当前模型并没有真正学会可靠算术，只是在小范围内记住了一些模式。
-
-## 项目结构
-
-```text
-.
-├── gpt_from_scratch/
-│   ├── model.py          # Transformer, forward, backward, checkpoint
-│   ├── optim.py          # AdamW
-│   ├── tokenizer.py      # char/subword tokenizer and conversation formatting
-│   └── __init__.py
-├── prepare_data.py       # JSONL -> token bin + loss mask
-├── train.py              # training loop
-├── sample.py             # autoregressive sampling
-├── filter_dataset.py     # simple dataset filtering
-├── build_curriculum.py   # curriculum dataset builder
-├── build_math_drill.py   # arithmetic drill dataset builder
-└── README.md
-```
-
-## 环境
-
-推荐环境：
-
-```text
-Python 3.11+
-NumPy
-CuPy with CUDA support
-NVIDIA GPU
-```
-
-CPU 也能运行，但训练速度会慢很多。
-
-安装依赖示例：
-
-```bash
-python3 -m pip install numpy cupy-cuda12x
-```
-
-如果没有 CUDA，可以只安装 NumPy，并在训练/采样时使用：
-
-```bash
---device cpu
-```
-
-## 训练性能参考
-
-在 RTX 5070 Ti 上，3.35M 参数模型、`seq_len=192`、`batch_size=16` 的训练速度大约在：
-
-```text
-150k - 165k tokens/s
-```
-
-6.84M 参数模型、`seq_len=192`、`batch_size=12` 的训练速度大约在：
-
-```text
-85k - 95k tokens/s
-```
-
-实际速度取决于 CuPy 版本、CUDA 版本、batch size 和 eval 频率。
-
-## 已知限制
-
-这个项目目前仍然是实验性质的小模型训练系统。
-
-- 上下文长度只有 192。
-- 字符级 tokenizer 会让长文本更占上下文。
-- attention mask 每次 forward 都会重建，还有优化空间。
-- 没有 dropout、KV cache、mixed precision、gradient accumulation。
-- 没有成熟的 dataset packing 和 checkpoint resume optimizer state。
-- 手写 backward 更容易调试，但性能不如成熟框架。
-- 小模型很容易被数据污染带偏。
-- 当前 checkpoint 对课程内短问答表现较好，对冷门知识和复杂推理不可靠。
-
-## 为什么不直接用大框架
-
-这个项目的重点是可见性。用成熟框架写一个小 GPT 很快，但很多关键细节会被 autograd、module abstraction 和 optimizer wrapper 隐藏起来。
-
-这里保留了训练语言模型最核心的部件：
-
-- tensor shape 怎么流动
-- attention 的梯度怎么回传
-- tied embedding 的梯度怎么合并
-- loss mask 怎么影响 dlogits
-- 小数据污染如何改变生成分布
-- curriculum fine-tuning 如何纠正小模型行为
-
-适合用来学习、调试和做小规模训练实验。
+过滤脚本的短语规则只是历史实验启发式，不代表高质量数据标准；例如直接排除“我无法”可能删除合理回答。应结合实际任务审核数据。当前没有 KV cache、混合精度、梯度累积或分布式训练，数据和有效窗口索引驻留内存，不适合直接扩展到大规模训练。
 
 ## License
 
-No license has been selected yet. Add a license before redistributing or using this code in another project.
+[MIT](LICENSE)，Copyright (c) 2026 Lao Chou。更新记录见 [VERSIONS.md](VERSIONS.md)。

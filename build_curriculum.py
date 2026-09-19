@@ -1,5 +1,6 @@
 import argparse
 import json
+from pathlib import Path
 import random
 from collections import Counter
 
@@ -159,7 +160,11 @@ def assistant_text(obj):
 
 
 def is_single_turn(obj):
+    if not isinstance(obj, dict):
+        return False
     convs = obj.get("conversations", [])
+    if not isinstance(convs, list) or not all(isinstance(msg, dict) for msg in convs):
+        return False
     return (
         len(convs) == 2
         and convs[0].get("role") == "user"
@@ -218,6 +223,13 @@ def main():
     parser.add_argument("--shuffle-seed", type=int, default=20260427)
     parser.add_argument("--full-arithmetic", action="store_true")
     args = parser.parse_args()
+    if min(args.max_source, args.max_general, args.max_topic, args.seed_repeat, args.min_answer_chars, args.max_user_chars) < 0:
+        parser.error("curriculum counts and lengths must be nonnegative")
+    if args.max_answer_chars < args.min_answer_chars:
+        parser.error("max-answer-chars must be at least min-answer-chars")
+    if Path(args.input).resolve() == Path(args.output).resolve():
+        parser.error("input and output must be different files")
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(args.shuffle_seed)
     seeds = (SEED_EXAMPLES + add_generated_examples(args.full_arithmetic)) * args.seed_repeat
@@ -229,6 +241,8 @@ def main():
     kept_candidates = 0
     with open(args.input, "r", encoding="utf-8") as src:
         for line in src:
+            if len(topic) >= args.max_topic and len(general) >= args.max_general:
+                break
             if args.max_source is not None and seen >= args.max_source:
                 break
             seen += 1
